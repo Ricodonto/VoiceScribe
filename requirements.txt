@@ -1,0 +1,8 @@
+# VoiceScribe Requirements
+# Target: Windows 11, CPU Whisper (int8) + GPU Ollama (llama3.2:3b)
+
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.10.0
+ollama>=0.3.0

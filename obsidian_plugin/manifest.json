@@ -1,0 +1,9 @@
+{
+  "id": "voicescribe",
+  "name": "VoiceScribe",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Continuous local voice-to-notes transcription and synthesis with citations and audio links.",
+  "author": "VoiceScribe",
+  "isDesktopOnly": true
+}
