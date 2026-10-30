@@ -1,151 +1,225 @@
 """
-End-to-End Pipeline Verification Test for VoiceScribe
-Simulates:
-1. Audio generation / injection
-2. Thread 2 (Faster-Whisper on CPU + FFmpeg Opus archival)
-3. Thread 3 (Voice Command Routing + Filler Removal + Ollama Distillation + Atomic Writing)
+End-to-end pipeline test with a simulated microphone, fake Whisper and fake Ollama.
+Exercises the real threads, VAD segmentation, Ogg/Opus archiving, transcript + note
+writing, voice commands and the graceful stop/drain sequence.
+Run:  venv\\Scripts\\python.exe test_pipeline_e2e.py
 """
-
-import os
 import sys
 import tempfile
-import time
-from datetime import datetime
-from pathlib import Path
-import queue
 import threading
-import numpy as np
+import time
+import types
+from pathlib import Path
 
-if sys.platform == "win32":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scribe_router import (
-    ScribeConfig,
-    AudioChunk,
-    TranscriptionThread,
-    RouterSynthesisThread,
-    archive_audio_opus,
-    atomic_append_note
-)
+SR = 16000
+BLOCK = 1024
+SCRIPT = ["Topic French toast", "Use brioche and soak it for thirty seconds.",
+          "Um, add a pinch of cinnamon to the eggs.", "Thank you."]
 
 
-def run_e2e_pipeline_test():
-    print("=== Running End-to-End VoiceScribe Pipeline Test ===")
+# --- fake microphone: speech bursts (quiet, like the real log) separated by 2.5 s of silence
+class FakeInputStream:
+    def __init__(self, samplerate, channels, dtype, device, callback, blocksize):
+        self.cb = callback
+        self._stop = threading.Event()
 
-    with tempfile.TemporaryDirectory() as temp_vault:
-        vault_path = Path(temp_vault)
-        config = ScribeConfig(
-            vault_dir=str(vault_path),
-            whisper_model="base.en",
-            whisper_compute_type="int8",
-            whisper_threads=4,
-            ollama_model="llama3.2:3b",
-            ollama_host="http://127.0.0.1:11434",
-            default_note="Initial_Test",
-            energy_threshold=0.0001
-        )
+    def __enter__(self):
+        def feed():
+            rng = np.random.default_rng(0)
+            plan = []
+            for _ in SCRIPT:
+                plan += [0.003] * int(2.0 * SR / BLOCK) + [0.0002] * int(2.5 * SR / BLOCK)
+            for amp in plan + [0.0002] * 2000:
+                if self._stop.is_set():
+                    return
+                block = (rng.standard_normal((BLOCK, 1)) * amp).astype(np.float32)
+                self.cb(block, BLOCK, None, None)
+                time.sleep(0.002)  # ~30x faster than real time
+        threading.Thread(target=feed, daemon=True).start()
+        return self
 
-        audio_queue = queue.Queue(maxsize=10)
-        transcription_queue = queue.Queue(maxsize=10)
-        stop_event = threading.Event()
+    def __exit__(self, *a):
+        self._stop.set()
 
-        # Start Transcription Thread (Thread 2)
-        transcribe_worker = TranscriptionThread(
-            audio_queue=audio_queue,
-            transcription_queue=transcription_queue,
-            stop_event=stop_event,
-            config=config
-        )
 
-        # Start Router & Synthesis Thread (Thread 3)
-        router_worker = RouterSynthesisThread(
-            transcription_queue=transcription_queue,
-            stop_event=stop_event,
-            config=config
-        )
+sys.modules["sounddevice"] = types.SimpleNamespace(
+    InputStream=FakeInputStream, query_devices=lambda *a, **k: {"name": "Fake mic"}, PortAudioError=Exception)
 
-        print("[1/4] Starting worker threads...")
-        transcribe_worker.start()
-        router_worker.start()
 
-        # We will test:
-        # A) Direct voice command simulation: "Topic Smart Contracts"
-        print("[2/4] Testing voice command routing...")
-        router_worker.set_active_topic("Smart Contracts")
-        assert router_worker.active_filename == "Smart Contracts.md"
-        print(f"  -> Active note verified: {router_worker.active_filename}")
+# --- fake Whisper: returns the next scripted sentence per chunk
+class FakeSeg:
+    def __init__(self, text):
+        self.text, self.no_speech_prob, self.avg_logprob = text, 0.01, -0.2
 
-        # B) Synthetic audio chunk archival verification
-        print("[3/4] Testing audio archival via FFmpeg Opus...")
-        sr = 16000
-        dur = 7.0
-        t = np.linspace(0, dur, int(sr * dur), dtype=np.float32)
-        audio_data = (0.3 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
 
-        opus_archive = vault_path / "VoiceScribe_Archives" / "test_run.opus"
-        success = archive_audio_opus(audio_data, sr, opus_archive, bitrate="10k")
-        assert success and opus_archive.exists(), "Opus archiving failed!"
-        print(f"  -> Opus archived successfully ({opus_archive.stat().st_size} bytes)")
+class FakeWhisper:
+    calls = 0
 
-        # C) Full Note writing & Ollama synthesis verification
-        print("[4/4] Testing separate session transcript and thematic note integration...")
-        raw_thought = "Um, you know, we really must optimize the smart contract gas limits before the mainnet launch on Tuesday."
-        from scribe_router import strip_verbal_fillers, append_session_transcript, integrate_note_thematically
-        cleaned = strip_verbal_fillers(raw_thought)
+    def __init__(self, name, **kw):
+        self.local_only = kw.get("local_files_only")
 
-        chunk_id = "t-204510"
-        time_str = "20:45:10"
-        date_str = "2026-10-25"
+    def transcribe(self, audio, **kw):
+        assert np.max(np.abs(audio)) > 0.2, "audio should be normalised before transcription"
+        text = SCRIPT[FakeWhisper.calls % len(SCRIPT)]
+        FakeWhisper.calls += 1
+        time.sleep(0.3)
+        return iter([FakeSeg(text)]), None
 
-        # 1. Append to separate transcript file
-        append_session_transcript(
-            vault_dir=vault_path,
-            transcripts_folder="Transcripts",
-            topic_title="Smart Contracts",
-            chunk_id=chunk_id,
-            timestamp_str=time_str,
-            text=cleaned,
-            audio_rel_path="VoiceScribe_Archives/test_run.opus"
-        )
-        t_file = vault_path / "Transcripts" / f"{datetime.now().strftime('%Y-%m-%d')}_Transcript.md"
-        assert t_file.exists(), "Transcript file was not created!"
-        t_text = t_file.read_text(encoding="utf-8")
-        assert f"^{chunk_id}" in t_text
-        assert "![[VoiceScribe_Archives/test_run.opus]]" in t_text
 
-        # 2. Integrate into thematic main note
-        target_file = router_worker.get_active_filepath()
-        citation = f"([[Transcripts/{datetime.now().strftime('%Y-%m-%d')}_Transcript#^{chunk_id}|🔗 {time_str}]] · [[VoiceScribe_Archives/test_run.opus|▶ Audio]])"
-        success = integrate_note_thematically(
-            note_filepath=target_file,
-            topic_title="Smart Contracts",
-            new_statement=cleaned,
-            citation_tag=citation,
-            config=config
-        )
-        assert success and target_file.exists(), f"Target file {target_file} was not created!"
+class FakeTimedSeg:
+    def __init__(self, start, end, text):
+        self.start, self.end, self.text = start, end, text
+        self.no_speech_prob, self.avg_logprob, self.compression_ratio = 0.01, -0.2, 1.2
 
-        content = target_file.read_text(encoding="utf-8")
-        print("\n--- Generated Note Content ---")
-        print(content)
-        print("------------------------------")
 
-        assert "# Smart Contracts" in content
-        assert "## 💡 Notes" in content
-        assert "[[Transcripts/" in content
+IMPORT_SCRIPT = [(1.0, 4.0, "First idea about the garden hose."), (4.2, 6.0, "It should be at least twenty metres."),
+                 (9.0, 12.0, "Create a new note named Holiday."), (14.0, 18.0, "We could visit Lisbon in May."),
+                 (21.0, 24.0, "Scratch that."), (26.0, 30.0, "We could visit Porto in June.")]
 
-        # Stop workers
-        stop_event.set()
-        transcribe_worker.join(timeout=3.0)
-        router_worker.join(timeout=3.0)
 
-    print("\n✅ End-to-End Pipeline Verification Test Passed Completely!")
+def fake_decode_audio(path, sampling_rate=16000):
+    rng = np.random.default_rng(1)
+    return (rng.standard_normal(sampling_rate * 32) * 0.05).astype(np.float32)
+
+
+class FakeImportWhisper(FakeWhisper):
+    def transcribe(self, audio, **kw):
+        if len(audio) > 16000 * 20:  # whole recording
+            return iter([FakeTimedSeg(*s) for s in IMPORT_SCRIPT]), None
+        return super().transcribe(audio, **kw)
+
+
+sys.modules["faster_whisper"] = types.SimpleNamespace(WhisperModel=FakeImportWhisper, decode_audio=fake_decode_audio)
+
+import scribe_router as sr  # noqa: E402
+
+
+def fake_llm(config, outline, statement, topic):
+    return {"items": [{"action": "add", "heading": "Recipe", "bullet": statement.rstrip("."), "target": None}]}
+
+
+sr.ask_llm_for_placement = fake_llm
+sr.ensure_ollama_running = lambda host: True
+
+
+def main():
+    with tempfile.TemporaryDirectory() as d:
+        vault = Path(d)
+        cfg = sr.ScribeConfig(vault_dir=str(vault), energy_threshold=0.0012, pause_duration_sec=1.7)
+        svc = sr.VoiceScribeService(cfg)
+        sr.STOP_SIGNAL_FILE = vault / "stop.signal"
+        sr.PID_FILE = vault / "pid"
+
+        def stopper():
+            # wait until all speech has been captured, then request stop like Obsidian does
+            while svc.thread_audio.total_chunks_captured < len(SCRIPT):
+                time.sleep(0.05)
+            (vault / "stop.signal").write_text("stop")
+        threading.Thread(target=stopper, daemon=True).start()
+
+        code = svc.start()
+        assert code == 0
+        assert svc.thread_audio.total_chunks_captured == 4, svc.thread_audio.total_chunks_captured
+        assert svc.thread_transcribe.total_transcribed == 3  # "Thank you." filtered as hallucination
+        assert svc.thread_router.total_notes_written == 2
+
+        note = (vault / "French toast.md").read_text(encoding="utf-8")
+        print(note)
+        assert "### Recipe" in note
+        assert "Use brioche and soak it for thirty seconds" in note
+        assert "Add a pinch of cinnamon to the eggs" in note
+        assert "▶ Audio]]" in note and ".ogg|" in note
+
+        transcripts = list((vault / "Transcripts").glob("*_Transcript.md"))
+        assert len(transcripts) == 1
+        t = transcripts[0].read_text(encoding="utf-8")
+        assert "Um, add a pinch" in t  # transcript stays verbatim
+        oggs = list((vault / "VoiceScribe_Archives").rglob("*.ogg"))
+        assert len(oggs) == 3, oggs  # no-speech chunk's audio removed
+        default_note = (vault / "Voice Notes.md").read_text(encoding="utf-8")
+        assert "- " not in default_note  # created empty at start; the command chunk added nothing
+        print("\nE2E PASSED")
+
+
+def import_test():
+    """An audio file goes through the same pipeline: clips, transcript, notes, voice commands, undo."""
+    with tempfile.TemporaryDirectory() as d:
+        vault = Path(d)
+        rec = vault / "memo.m4a"
+        rec.write_bytes(b"fake")
+        cfg = sr.ScribeConfig(vault_dir=str(vault), start_note="Garden.md", properties_enabled=False,
+                              autolink_enabled=False, summary_enabled=False)
+        code = sr.ImportService(cfg, str(rec)).run()
+        assert code == 0
+        garden = (vault / "Garden.md").read_text(encoding="utf-8")
+        holiday = (vault / "Holiday.md").read_text(encoding="utf-8")
+        print(garden, holiday, sep="\n")
+        assert "First idea about the garden hose It should be at least twenty metres" in garden.replace(".", "")
+        assert "Porto in June" in holiday and "Lisbon" not in holiday  # "scratch that" undid Lisbon
+        assert len(list((vault / "VoiceScribe_Archives").rglob("*.ogg"))) == 5
+        print("IMPORT PASSED")
+
+
+def batch_import_test():
+    """Batch mode: thoughts collect in the inbox and are organised together when the run ends."""
+    seen = {}
+
+    def fake_batch(config, title, outline, thoughts):
+        seen.setdefault(title, []).append(list(thoughts))
+        return {"items": [{"action": "add", "heading": "Plans", "bullet": t.rstrip("."), "sources": [f"T{i + 1}"], "target": None}
+                          for i, t in enumerate(thoughts) if "Scratch" not in t]}
+    orig = sr.ask_llm_for_batch
+    sr.ask_llm_for_batch = fake_batch
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            vault = Path(d)
+            rec = vault / "memo.m4a"
+            rec.write_bytes(b"fake")
+            cfg = sr.ScribeConfig(vault_dir=str(vault), start_note="Garden.md", organise_mode="batch", batch_interval_min=0,
+                                  properties_enabled=False, autolink_enabled=False, summary_enabled=False)
+            assert sr.ImportService(cfg, str(rec)).run() == 0
+            garden = (vault / "Garden.md").read_text(encoding="utf-8")
+            holiday = (vault / "Holiday.md").read_text(encoding="utf-8")
+            print(garden, holiday, sep="\n")
+            assert "Inbox" not in garden and "Inbox" not in holiday
+            assert "### Plans" in garden and "### Plans" in holiday
+            assert "Porto in June" in holiday and "Lisbon" not in holiday     # "scratch that" removed it from the inbox
+            assert seen["Garden"] and seen["Holiday"] == [["We could visit Porto in June."]]
+            print("BATCH PASSED")
+    finally:
+        sr.ask_llm_for_batch = orig
+
+
+def pause_test():
+    """While paused, speech is ignored; after resuming it is captured again."""
+    import queue as q
+    cfg = sr.ScribeConfig(energy_threshold=0.0012, pause_duration_sec=1.7)
+    aq = q.Queue()
+    stop = threading.Event()
+    th = sr.AudioIngestionThread(aq, stop, cfg)
+    th.set_paused(True)
+    th.start()
+    time.sleep(1.5)                        # fake mic plays its speech while paused
+    assert aq.qsize() == 0
+    th.set_paused(False)
+    rng = np.random.default_rng(3)
+    for amp in [0.004] * 30 + [0.0002] * 40:  # one spoken thought after resuming
+        th.raw_blocks.put((rng.standard_normal(BLOCK) * amp).astype(np.float32))
+    deadline = time.time() + 20
+    while aq.qsize() == 0 and time.time() < deadline:
+        time.sleep(0.1)
+    stop.set()
+    th.join(5)
+    assert aq.qsize() >= 1
+    print("PAUSE PASSED")
 
 
 if __name__ == "__main__":
-    run_e2e_pipeline_test()
+    main()
+    import_test()
+    batch_import_test()
+    pause_test()

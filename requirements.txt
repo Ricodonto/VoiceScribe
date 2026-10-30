@@ -1,5 +1,6 @@
-# VoiceScribe Requirements
-# Target: Windows 11, CPU Whisper (int8) + GPU Ollama (llama3.2:3b)
+# VoiceScribe backend requirements (Python 3.10+)
+# Whisper runs on the CPU (faster-whisper, int8); notes are organised by a local Ollama model.
+# PyAV is installed with faster-whisper and is used as a fallback Opus encoder when FFmpeg is missing.
 
 faster-whisper>=1.0.0
 sounddevice>=0.4.6

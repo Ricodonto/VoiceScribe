@@ -1,5 +1,20 @@
-venv
-__pycache__
-.agents
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime files written by VoiceScribe
+config.json
+voicescribe.log
+stop.signal
+voicescribe.pid
+
+# Obsidian vault settings (the backend folder can be opened as a vault)
+.obsidian/
+
+# Local agent tooling
+.agents/
 AGENTS.md
 .env
+gpu_probe.json

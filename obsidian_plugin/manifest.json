@@ -1,9 +1,9 @@
 {
   "id": "voicescribe",
   "name": "VoiceScribe",
-  "version": "1.0.0",
-  "minAppVersion": "0.15.0",
-  "description": "Continuous local voice-to-notes transcription and synthesis with citations and audio links.",
+  "version": "1.7.0",
+  "minAppVersion": "1.4.0",
+  "description": "Continuous local voice-to-notes: transcribes your speech with Whisper, organises it into notes with a local LLM, and links every point back to its transcript and audio clip.",
   "author": "VoiceScribe",
   "isDesktopOnly": true
 }

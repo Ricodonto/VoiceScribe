@@ -27,6 +27,9 @@ if not exist "venv\Scripts\python.exe" (
     )
 )
 
+:: 1b. Create config.json from the example on first run
+if not exist "config.json" copy /y "config.example.json" "config.json" >nul
+
 :: 2. Check FFmpeg on PATH
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
